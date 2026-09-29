@@ -170,15 +170,41 @@ def get_knn_index(
     Returns:
         torch.Tensor: (n_pts, k)
     """
-    if points2 is None:
-        _k = k if include_self else k + 1
-        knn_index = knn(points, points, k=_k)[1].view(len(points), _k)
-        if not include_self:
-            knn_index = knn_index[:, 1:]
-    else:
-        knn_index = knn(points2, points, k=k)[1].view(len(points), k)
-
-    return knn_index
+    try:
+        if points2 is None:
+            _k = k if include_self else k + 1
+            knn_index = knn(points, points, k=_k)[1].view(len(points), _k)
+            if not include_self:
+                knn_index = knn_index[:, 1:]
+        else:
+            knn_index = knn(points2, points, k=k)[1].view(len(points), k)
+        return knn_index
+    except ImportError as exc:
+        # ``torch-cluster`` supplies the fast CUDA KNN used by PyG.  Guided
+        # inference can still run in lightweight environments without that
+        # optional extension: compute exact KNN in bounded chunks instead of
+        # materializing the full N x N distance matrix.
+        if "torch-cluster" not in str(exc):
+            raise
+        if points2 is not None:
+            raise ImportError(
+                "torch-cluster is required for cross-cloud KNN queries."
+            ) from exc
+        if len(points) <= int(not include_self):
+            raise ValueError("Not enough points for the requested KNN query.")
+        query_chunk = 2048
+        output = []
+        with torch.no_grad():
+            reference = points.float()
+            for start in range(0, len(points), query_chunk):
+                stop = min(start + query_chunk, len(points))
+                distances = torch.cdist(reference[start:stop], reference)
+                if not include_self:
+                    local_rows = torch.arange(stop - start, device=points.device)
+                    global_cols = torch.arange(start, stop, device=points.device)
+                    distances[local_rows, global_cols] = float("inf")
+                output.append(torch.topk(distances, k=k, dim=1, largest=False).indices)
+        return torch.cat(output, dim=0)
 
 
 def get_point_cloud_main_axes(
